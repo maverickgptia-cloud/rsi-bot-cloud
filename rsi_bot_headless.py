@@ -19,17 +19,19 @@ EMA_FAST    = int(os.environ.get("BOT_EMA_FAST", "20"))
 EMA_SLOW    = int(os.environ.get("BOT_EMA_SLOW", "100"))
 RSI_BUY     = float(os.environ.get("BOT_RSI_BUY", "30"))
 RSI_SELL    = float(os.environ.get("BOT_RSI_SELL", "70"))
-EMA_SPREAD  = float(os.environ.get("BOT_EMA_SPREAD", "0.1"))
+EMA_SPREAD  = float(os.environ.get("BOT_EMA_SPREAD", "0.1"))   # % separación mínima EMAs
 ATR_PERIOD  = int(os.environ.get("BOT_ATR_PERIOD", "14"))
-ATR_STOP    = float(os.environ.get("BOT_ATR_STOP", "1.2"))
-ATR_TAKE    = float(os.environ.get("BOT_ATR_TAKE", "2.4"))
-RISK_PCT    = float(os.environ.get("BOT_RISK_PCT", "0.02"))
-FEE_BPS     = float(os.environ.get("BOT_FEE_BPS", "5.0"))
-INIT_CAP    = float(os.environ.get("BOT_INIT_CAP", "100.0"))
+ATR_STOP    = float(os.environ.get("BOT_ATR_STOP", "1.2"))     # SL = 1.2 * ATR
+ATR_TAKE    = float(os.environ.get("BOT_ATR_TAKE", "2.4"))     # TP = 2.4 * ATR
+RISK_PCT    = float(os.environ.get("BOT_RISK_PCT", "0.02"))    # 2% del capital en riesgo
+FEE_BPS     = float(os.environ.get("BOT_FEE_BPS", "5.0"))      # 0.05% por lado
+INIT_CAP    = float(os.environ.get("BOT_INIT_CAP", "100.0"))   # Capital inicial por ejecución
 
 LOG_PATH    = os.path.expanduser("~/trades_log.csv")
-TIMEFRAME   = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","60m":"1h",
-               "60m":"1h","1h":"1h","4h":"4h","1d":"1d"}.get(INTERVAL, INTERVAL)
+TIMEFRAME   = {
+    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "60m": "1h", "1h": "1h", "4h": "4h", "1d": "1d"
+}.get(INTERVAL, INTERVAL)
 
 # =============================== Utilidades de indicadores ===============================
 def ema(s: pd.Series, w: int) -> pd.Series:
@@ -49,13 +51,22 @@ def atr(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14) -> pd.Series
     tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
+def safe_float(x):
+    """Convierte a float o devuelve NaN si no es convertible."""
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
 # ================================== Datos e indicadores ==================================
 def fetch_ohlc() -> pd.DataFrame:
     df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False)
     if df.empty:
         return pd.DataFrame()
-    df = df.rename(columns={"Open":"open","High":"high","Low":"low",
-                            "Close":"close","Adj Close":"close","Volume":"volume"})
+    df = df.rename(columns={
+        "Open": "open", "High": "high", "Low": "low",
+        "Close": "close", "Adj Close": "close", "Volume": "volume"
+    })
     df.index.name = "ts"
     df = df.dropna().tail(LOOKBACK).astype(float)
     return df
@@ -81,6 +92,10 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 # ================================ Backtest (paper trading) ================================
 def backtest(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve un DataFrame con columnas:
+    ts, symbol, timeframe, side, price, qty, pnl, capital, rsi, ema_fast, ema_slow, atr, reason
+    """
     fee = FEE_BPS / 1e4
     capital = INIT_CAP
     pos_qty = 0.0
@@ -90,14 +105,15 @@ def backtest(df: pd.DataFrame) -> pd.DataFrame:
     for i in range(1, len(df)):
         row = df.iloc[i]
         ts   = df.index[i]
-        c    = float(row["close"])
-        h    = float(row["high"])
-        l    = float(row["low"])
-        rsi_v = float(row["rsi"]) if np.isfinite(row["rsi"]) else np.nan
-        atr_v = float(row["atr"]) if np.isfinite(row["atr"]) else None
-        ef    = float(row["ema_fast"]) if np.isfinite(row["ema_fast"]) else np.nan
-        es    = float(row["ema_slow"]) if np.isfinite(row["ema_slow"]) else np.nan
+        c    = safe_float(row["close"])
+        h    = safe_float(row["high"])
+        l    = safe_float(row["low"])
+        rsi_v = safe_float(row["rsi"])
+        atr_v = safe_float(row["atr"])
+        ef    = safe_float(row["ema_fast"])
+        es    = safe_float(row["ema_slow"])
 
+        # ---- Salidas (TP / SL / señal de venta) ----
         if pos_qty > 0.0:
             px = None
             reason = None
@@ -115,16 +131,30 @@ def backtest(df: pd.DataFrame) -> pd.DataFrame:
                 capital += proceeds
                 rows.append({
                     "ts": pd.to_datetime(ts).tz_localize(None),
-                    "symbol": SYMBOL, "timeframe": TIMEFRAME,
-                    "side":"SELL", "price": round(px, 2), "qty": round(pos_qty, 8),
-                    "pnl": round(pnl, 2), "capital": round(capital, 2),
-                    "rsi": round(rsi_v, 2), "ema_fast": round(ef, 2), "ema_slow": round(es, 2),
-                    "atr": round(atr_v, 2) if atr_v else np.nan, "reason": reason
+                    "symbol": SYMBOL,
+                    "timeframe": TIMEFRAME,
+                    "side": "SELL",
+                    "price": round(px, 2),
+                    "qty": round(pos_qty, 8),
+                    "pnl": round(pnl, 2),
+                    "capital": round(capital, 2),
+                    "rsi": round(rsi_v, 2) if np.isfinite(rsi_v) else np.nan,
+                    "ema_fast": round(ef, 2) if np.isfinite(ef) else np.nan,
+                    "ema_slow": round(es, 2) if np.isfinite(es) else np.nan,
+                    "atr": round(atr_v, 2) if np.isfinite(atr_v) else np.nan,
+                    "reason": reason,
                 })
                 pos_qty = 0.0
                 entry = stop = take = None
 
-        if pos_qty == 0.0 and bool(row["buy_sig"]) and atr_v and atr_v > 0:
+        # ---- Entradas ----
+        if (
+            pos_qty == 0.0
+            and bool(row["buy_sig"])
+            and np.isfinite(atr_v)
+            and atr_v > 0
+            and np.isfinite(c)
+        ):
             risk_cash = capital * RISK_PCT
             stop_dist = ATR_STOP * atr_v
             qty = risk_cash / max(stop_dist, 1e-9)
@@ -140,20 +170,42 @@ def backtest(df: pd.DataFrame) -> pd.DataFrame:
                     take    = c + ATR_TAKE * atr_v
                     rows.append({
                         "ts": pd.to_datetime(ts).tz_localize(None),
-                        "symbol": SYMBOL, "timeframe": TIMEFRAME,
-                        "side":"BUY", "price": round(entry, 2), "qty": round(pos_qty, 8),
-                        "pnl": 0.0, "capital": round(capital, 2),
-                        "rsi": round(rsi_v, 2), "ema_fast": round(ef, 2), "ema_slow": round(es, 2),
-                        "atr": round(atr_v, 2) if atr_v else np.nan, "reason":"ENTRY"
+                        "symbol": SYMBOL,
+                        "timeframe": TIMEFRAME,
+                        "side": "BUY",
+                        "price": round(entry, 2),
+                        "qty": round(pos_qty, 8),
+                        "pnl": 0.0,
+                        "capital": round(capital, 2),
+                        "rsi": round(rsi_v, 2) if np.isfinite(rsi_v) else np.nan,
+                        "ema_fast": round(ef, 2) if np.isfinite(ef) else np.nan,
+                        "ema_slow": round(es, 2) if np.isfinite(es) else np.nan,
+                        "atr": round(atr_v, 2) if np.isfinite(atr_v) else np.nan,
+                        "reason": "ENTRY",
                     })
 
-    return pd.DataFrame(rows, columns=[
-        "ts","symbol","timeframe","side","price","qty","pnl","capital",
-        "rsi","ema_fast","ema_slow","atr","reason"
-    ])
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "ts",
+            "symbol",
+            "timeframe",
+            "side",
+            "price",
+            "qty",
+            "pnl",
+            "capital",
+            "rsi",
+            "ema_fast",
+            "ema_slow",
+            "atr",
+            "reason",
+        ],
+    )
 
 # ===================================== Logging CSV ======================================
 def append_log_csv(trades: pd.DataFrame, path: str):
+    """Anexa con cabecera si el archivo no existe o está vacío."""
     if trades.empty:
         return
     path = os.path.expanduser(path)
@@ -174,6 +226,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
