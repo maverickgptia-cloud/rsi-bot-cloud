@@ -51,28 +51,33 @@ def atr(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14) -> pd.Series
     tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-def safe_float(x):
-    """Convierte a float o devuelve NaN si no es convertible."""
-    try:
-        return float(x)
-    except Exception:
-        return np.nan
-
 # ================================== Datos e indicadores ==================================
 def fetch_ohlc() -> pd.DataFrame:
     df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False)
     if df.empty:
         return pd.DataFrame()
-    df = df.rename(columns={
-        "Open": "open", "High": "high", "Low": "low",
-        "Close": "close", "Adj Close": "close", "Volume": "volume"
-    })
+
+    df = df.rename(
+        columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Adj Close": "close",
+            "Volume": "volume",
+        }
+    )
     df.index.name = "ts"
-    df = df.dropna().tail(LOOKBACK).astype(float)
+    df = df.dropna()
+    df = df.tail(LOOKBACK)
+    df = df.astype(float, errors="ignore")
     return df
 
 def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
-    c, h, l = df["close"], df["high"], df["low"]
+    c = df["close"]
+    h = df["high"]
+    l = df["low"]
+
     df["ema_fast"] = ema(c, EMA_FAST)
     df["ema_slow"] = ema(c, EMA_SLOW)
     df["rsi"]      = rsi(c, 14)
@@ -84,7 +89,12 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
     trend_long  = df["ema_fast"] > df["ema_slow"]
     trend_short = df["ema_fast"] < df["ema_slow"]
 
-    spread_ok = (df["ema_fast"] - df["ema_slow"]).abs() / df["ema_slow"].abs() * 100 > EMA_SPREAD
+    spread_ok = (
+        (df["ema_fast"] - df["ema_slow"]).abs()
+        / df["ema_slow"].abs()
+        * 100
+        > EMA_SPREAD
+    )
 
     df["buy_sig"]  = base_buy  & trend_long  & spread_ok
     df["sell_sig"] = base_sell & trend_short & spread_ok
@@ -102,26 +112,48 @@ def backtest(df: pd.DataFrame) -> pd.DataFrame:
     entry = stop = take = None
 
     rows = []
+
     for i in range(1, len(df)):
-        row = df.iloc[i]
-        ts   = df.index[i]
-        c    = safe_float(row["close"])
-        h    = safe_float(row["high"])
-        l    = safe_float(row["low"])
-        rsi_v = safe_float(row["rsi"])
-        atr_v = safe_float(row["atr"])
-        ef    = safe_float(row["ema_fast"])
-        es    = safe_float(row["ema_slow"])
+        ts = df.index[i]
+
+        # Valores OHLC escalares
+        c = float(df["close"].iloc[i])
+        h = float(df["high"].iloc[i])
+        l = float(df["low"].iloc[i])
+
+        # Indicadores escalares (cuidando NaNs)
+        rsi_raw = df["rsi"].iloc[i]
+        if pd.notna(rsi_raw) and np.isfinite(rsi_raw):
+            rsi_v = float(rsi_raw)
+        else:
+            rsi_v = np.nan
+
+        atr_raw = df["atr"].iloc[i]
+        if pd.notna(atr_raw) and np.isfinite(atr_raw):
+            atr_v = float(atr_raw)
+        else:
+            atr_v = None
+
+        ef_raw = df["ema_fast"].iloc[i]
+        es_raw = df["ema_slow"].iloc[i]
+        ef = float(ef_raw) if pd.notna(ef_raw) and np.isfinite(ef_raw) else np.nan
+        es = float(es_raw) if pd.notna(es_raw) and np.isfinite(es_raw) else np.nan
+
+        buy_sig_raw  = df["buy_sig"].iloc[i]
+        sell_sig_raw = df["sell_sig"].iloc[i]
+        buy_sig  = bool(buy_sig_raw)  if not pd.isna(buy_sig_raw)  else False
+        sell_sig = bool(sell_sig_raw) if not pd.isna(sell_sig_raw) else False
 
         # ---- Salidas (TP / SL / señal de venta) ----
         if pos_qty > 0.0:
             px = None
             reason = None
+
             if take is not None and h >= take:
                 px, reason = take, "TP"
             elif stop is not None and l <= stop:
                 px, reason = stop, "SL"
-            elif bool(row["sell_sig"]):
+            elif sell_sig:
                 px, reason = c, "SELL_SIG"
 
             if px is not None:
@@ -129,37 +161,38 @@ def backtest(df: pd.DataFrame) -> pd.DataFrame:
                 cost_in  = pos_qty * entry * (1 + fee)
                 pnl      = proceeds - cost_in
                 capital += proceeds
-                rows.append({
-                    "ts": pd.to_datetime(ts).tz_localize(None),
-                    "symbol": SYMBOL,
-                    "timeframe": TIMEFRAME,
-                    "side": "SELL",
-                    "price": round(px, 2),
-                    "qty": round(pos_qty, 8),
-                    "pnl": round(pnl, 2),
-                    "capital": round(capital, 2),
-                    "rsi": round(rsi_v, 2) if np.isfinite(rsi_v) else np.nan,
-                    "ema_fast": round(ef, 2) if np.isfinite(ef) else np.nan,
-                    "ema_slow": round(es, 2) if np.isfinite(es) else np.nan,
-                    "atr": round(atr_v, 2) if np.isfinite(atr_v) else np.nan,
-                    "reason": reason,
-                })
+
+                rows.append(
+                    {
+                        "ts": pd.to_datetime(ts).tz_localize(None),
+                        "symbol": SYMBOL,
+                        "timeframe": TIMEFRAME,
+                        "side": "SELL",
+                        "price": round(px, 2),
+                        "qty": round(pos_qty, 8),
+                        "pnl": round(pnl, 2),
+                        "capital": round(capital, 2),
+                        "rsi": round(rsi_v, 2) if np.isfinite(rsi_v) else np.nan,
+                        "ema_fast": round(ef, 2) if np.isfinite(ef) else np.nan,
+                        "ema_slow": round(es, 2) if np.isfinite(es) else np.nan,
+                        "atr": round(atr_v, 2) if atr_v else np.nan,
+                        "reason": reason,
+                    }
+                )
+
                 pos_qty = 0.0
                 entry = stop = take = None
 
         # ---- Entradas ----
-        if (
-            pos_qty == 0.0
-            and bool(row["buy_sig"])
-            and np.isfinite(atr_v)
-            and atr_v > 0
-            and np.isfinite(c)
-        ):
+        if pos_qty == 0.0 and buy_sig and atr_v and atr_v > 0:
             risk_cash = capital * RISK_PCT
             stop_dist = ATR_STOP * atr_v
+
             qty = risk_cash / max(stop_dist, 1e-9)
+
             if qty * c > capital:
                 qty = capital / c
+
             if qty > 0:
                 cost = qty * c * (1 + fee)
                 if cost <= capital:
@@ -168,21 +201,24 @@ def backtest(df: pd.DataFrame) -> pd.DataFrame:
                     entry   = c
                     stop    = c - stop_dist
                     take    = c + ATR_TAKE * atr_v
-                    rows.append({
-                        "ts": pd.to_datetime(ts).tz_localize(None),
-                        "symbol": SYMBOL,
-                        "timeframe": TIMEFRAME,
-                        "side": "BUY",
-                        "price": round(entry, 2),
-                        "qty": round(pos_qty, 8),
-                        "pnl": 0.0,
-                        "capital": round(capital, 2),
-                        "rsi": round(rsi_v, 2) if np.isfinite(rsi_v) else np.nan,
-                        "ema_fast": round(ef, 2) if np.isfinite(ef) else np.nan,
-                        "ema_slow": round(es, 2) if np.isfinite(es) else np.nan,
-                        "atr": round(atr_v, 2) if np.isfinite(atr_v) else np.nan,
-                        "reason": "ENTRY",
-                    })
+
+                    rows.append(
+                        {
+                            "ts": pd.to_datetime(ts).tz_localize(None),
+                            "symbol": SYMBOL,
+                            "timeframe": TIMEFRAME,
+                            "side": "BUY",
+                            "price": round(entry, 2),
+                            "qty": round(pos_qty, 8),
+                            "pnl": 0.0,
+                            "capital": round(capital, 2),
+                            "rsi": round(rsi_v, 2) if np.isfinite(rsi_v) else np.nan,
+                            "ema_fast": round(ef, 2) if np.isfinite(ef) else np.nan,
+                            "ema_slow": round(es, 2) if np.isfinite(es) else np.nan,
+                            "atr": round(atr_v, 2) if atr_v else np.nan,
+                            "reason": "ENTRY",
+                        }
+                    )
 
     return pd.DataFrame(
         rows,
@@ -214,11 +250,15 @@ def append_log_csv(trades: pd.DataFrame, path: str):
 
 # ======================================== Main ==========================================
 def main():
-    print(f"[{datetime.now(tz.utc).isoformat()}] Bot {SYMBOL} {TIMEFRAME} iniciado…")
+    now_str = datetime.now(tz.utc).isoformat()
+    print(f"[{now_str}] Bot {SYMBOL} {TIMEFRAME} iniciado…")
     df = fetch_ohlc()
+    print(f"Filas OHLC descargadas: {len(df)}")
+
     if df.empty:
         print("Sin datos OHLC — fin.")
         return
+
     df = compute_signals(df)
     trades = backtest(df)
     append_log_csv(trades, LOG_PATH)
@@ -226,4 +266,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
