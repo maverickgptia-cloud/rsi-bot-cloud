@@ -3,52 +3,75 @@
 # Guarda/añade operaciones en: ~/trades_log.csv (con cabeceras)
 
 import os
-from datetime import datetime, timezone as tz
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from datetime import datetime, timezone as tz
+
+# ===================== Helpers para leer variables de entorno =====================
+
+def _env_str(name: str, default: str) -> str:
+    v = os.environ.get(name, default)
+    # Limpieza básica de espacios
+    return str(v).strip()
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name, str(default))
+    v = str(v).strip()
+    # Reemplazamos coma por punto por si acaso
+    v = v.replace(",", ".")
+    try:
+        return int(float(v))
+    except ValueError:
+        return int(default)
+
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name, str(default))
+    v = str(v).strip()
+    v = v.replace(",", ".")
+    try:
+        return float(v)
+    except ValueError:
+        return float(default)
 
 # ===================== Parámetros (con overrides por variables de entorno) =====================
-SYMBOL = os.environ.get("BOT_SYMBOL", "BTC-USD")
-INTERVAL = os.environ.get("BOT_INTERVAL", "60m")   # 60m = 1h
-PERIOD = os.environ.get("BOT_PERIOD", "180d")      # histórico descargado
-LOOKBACK = int(os.environ.get("BOT_LOOKBACK", "800"))
+
+SYMBOL      = _env_str("BOT_SYMBOL",   "BTC-USD")
+INTERVAL    = _env_str("BOT_INTERVAL", "60m")    # 60m = 1h
+PERIOD      = _env_str("BOT_PERIOD",   "180d")   # histórico descargado
+LOOKBACK    = _env_int("BOT_LOOKBACK", 800)
 
 # Estrategia y gestión de riesgo
-EMA_FAST = int(os.environ.get("BOT_EMA_FAST", "20"))
-EMA_SLOW = int(os.environ.get("BOT_EMA_SLOW", "100"))
-RSI_BUY = float(os.environ.get("BOT_RSI_BUY", "30"))
-RSI_SELL = float(os.environ.get("BOT_RSI_SELL", "70"))
-EMA_SPREAD = float(os.environ.get("BOT_EMA_SPREAD", "0.1"))     # % separación mínima EMAs
-ATR_PERIOD = int(os.environ.get("BOT_ATR_PERIOD", "14"))
-ATR_STOP = float(os.environ.get("BOT_ATR_STOP", "1.2"))         # SL = 1.2 * ATR
-ATR_TAKE = float(os.environ.get("BOT_ATR_TAKE", "2.4"))         # TP = 2.4 * ATR
-RISK_PCT = float(os.environ.get("BOT_RISK_PCT", "0.02"))        # 2% del capital en riesgo
-FEE_BPS = float(os.environ.get("BOT_FEE_BPS", "5.0"))           # 0.05% por lado
-INIT_CAP = float(os.environ.get("BOT_INIT_CAP", "100.0"))       # Capital inicial por ejecución
+EMA_FAST    = _env_int("BOT_EMA_FAST",   20)
+EMA_SLOW    = _env_int("BOT_EMA_SLOW",   100)
+RSI_BUY     = _env_float("BOT_RSI_BUY",  30.0)
+RSI_SELL    = _env_float("BOT_RSI_SELL", 70.0)
+EMA_SPREAD  = _env_float("BOT_EMA_SPREAD", 0.10)   # % separación mínima EMAs
+ATR_PERIOD  = _env_int("BOT_ATR_PERIOD",  14)
+ATR_STOP    = _env_float("BOT_ATR_STOP",  1.2)     # SL = 1.2 * ATR
+ATR_TAKE    = _env_float("BOT_ATR_TAKE",  2.4)     # TP = 2.4 * ATR
+RISK_PCT    = _env_float("BOT_RISK_PCT",  0.02)    # 2% del capital en riesgo
+FEE_BPS     = _env_float("BOT_FEE_BPS",   5.0)     # 0.05% por lado
+INIT_CAP    = _env_float("BOT_INIT_CAP",  100.0)   # Capital inicial por ejecución
 
-LOG_PATH = os.path.expanduser("~/trades_log.csv")
-TIMEFRAME = {
-    "1m": "1m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "60m": "1h",
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1d",
-}.get(INTERVAL, INTERVAL)
+LOG_PATH    = os.path.expanduser("~/trades_log.csv")
+
+TIMEFRAME_MAP = {
+    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "60m": "1h", "1h": "1h", "4h": "4h", "1d": "1d"
+}
+TIMEFRAME   = TIMEFRAME_MAP.get(INTERVAL, INTERVAL)
 
 # =============================== Utilidades de indicadores ===============================
 
-def ema(s: pd.Series, w: int) -> pd.Series:
-    return s.ewm(span=int(w), adjust=False).mean()
+def ema(series: pd.Series, period: int) -> pd.Series:
+    """EMA simple sobre una serie (no la usamos directamente para evitar errores de asignación)."""
+    return series.ewm(span=int(period), adjust=False).mean()
 
 def rsi(c: pd.Series, period: int = 14) -> pd.Series:
-    d = c.diff()
-    g = d.clip(lower=0.0)
-    l = (-d).clip(lower=0.0)
+    d  = c.diff()
+    g  = d.clip(lower=0.0)
+    l  = (-d).clip(lower=0.0)
     ag = g.rolling(period).mean()
     al = l.rolling(period).mean().replace(0, np.nan)
     rs = ag / al
@@ -56,125 +79,87 @@ def rsi(c: pd.Series, period: int = 14) -> pd.Series:
 
 def atr(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14) -> pd.Series:
     prev = c.shift(1)
-    tr = pd.concat(
-        [(h - l), (h - prev).abs(), (l - prev).abs()],
-        axis=1
-    ).max(axis=1)
+    tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
-
-def safe_float(x, default=np.nan) -> float:
-    """Convierte a float sin romper si viene algo raro."""
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-def to_bool(val) -> bool:
-    """Convierte a bool evitando el error de Series ambiguo."""
-    if isinstance(val, (bool, np.bool_)):
-        return bool(val)
-    if isinstance(val, (pd.Series, pd.Array)):
-        # Si por lo que sea llega un Series, usamos .iloc[0] o any()
-        try:
-            return bool(val.iloc[0])
-        except Exception:
-            return bool(val.any())
-    if pd.isna(val):
-        return False
-    return bool(val)
 
 # ================================== Datos e indicadores ==================================
 
 def fetch_ohlc() -> pd.DataFrame:
+    """Descarga OHLC de yfinance y devuelve DataFrame con columnas:
+    ts, open, high, low, close, volume (float)
     """
-    Descarga OHLC con yfinance y devuelve un DataFrame con columnas:
-    ['open', 'high', 'low', 'close', 'volume'] y el índice como fecha.
-    Soporta tanto columnas normales como MultiIndex (ticker, campo).
-    """
-    raw = yf.download(
+    print(f"Descargando datos de {SYMBOL} | PERIOD={PERIOD} | INTERVAL={INTERVAL}")
+    df = yf.download(
         SYMBOL,
         period=PERIOD,
         interval=INTERVAL,
+        auto_adjust=False,
         progress=False,
-        auto_adjust=False,   # que no ajuste dividendos/ splits
-        group_by="ticker"    # a veces devuelve MultiIndex con el ticker
     )
 
-    if raw.empty:
+    if df is None or df.empty:
+        print("⚠ Sin datos desde yfinance.")
         return pd.DataFrame()
 
-    # Si viene con MultiIndex tipo (ticker, 'Open'), (ticker, 'High'), etc.
-    if isinstance(raw.columns, pd.MultiIndex):
-        # Si el primer nivel contiene el símbolo, nos quedamos solo con él
-        if SYMBOL in raw.columns.get_level_values(0):
-            df = raw.xs(SYMBOL, axis=1, level=0)
-        else:
-            # Por si acaso, aplanamos tomando el último nivel
-            df = raw.copy()
-            df.columns = [c[-1] for c in df.columns]
-    else:
-        df = raw.copy()
+    # Si viene con MultiIndex (ticker en columnas), nos quedamos con el primer nivel (Open, High, Low, Close, Volume)
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            df.columns = df.columns.get_level_values(0)
+        except Exception:
+            # En caso raro, cogemos la primera columna de cada par
+            df = df.copy()
+            df.columns = [c[0] for c in df.columns]
 
-    # Normalizamos nombres a minúsculas
-    df = df.rename(columns={
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Adj Close": "close",
-        "Volume": "volume",
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "volume": "volume",
-    })
+    df = df.rename(
+        columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Adj Close": "adj_close",
+            "Volume": "volume",
+        }
+    )
 
-    # Nos quedamos solo con las columnas necesarias si existen
-    needed = ["open", "high", "low", "close", "volume"]
-    cols_presentes = [c for c in needed if c in df.columns]
-
-    if len(cols_presentes) < 4:  # demasiado raro / incompleto
+    cols = ["open", "high", "low", "close", "volume"]
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        print(f"⚠ Faltan columnas OHLC en datos: {missing}")
         return pd.DataFrame()
 
-    df = df[cols_presentes]
-
+    df = df[cols].astype(float)
     df.index.name = "ts"
-    # Últimas LOOKBACK velas, todo como float
-    df = df.dropna().tail(LOOKBACK).astype(float)
+    df = df.dropna().tail(LOOKBACK)
 
+    print(f"Filas OHLC descargadas: {len(df)}")
     return df
 
-
-
 def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
-    c = df["close"]
-    h = df["high"]
-    l = df["low"]
+    c, h, l = df["close"], df["high"], df["low"]
 
-    df["ema_fast"] = ema(c, EMA_FAST)
-    df["ema_slow"] = ema(c, EMA_SLOW)
+    # EMAs (FORMA SEGURA: 1 sola columna cada una)
+    df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+
+    # RSI y ATR
     df["rsi"] = rsi(c, 14)
     df["atr"] = atr(h, l, c, ATR_PERIOD)
 
-    # Señales base de RSI (cruces)
-    base_buy = (df["rsi"].shift(1) <= RSI_BUY) & (df["rsi"] > RSI_BUY)
+    # Señales base RSI
+    base_buy  = (df["rsi"].shift(1) <= RSI_BUY)  & (df["rsi"] > RSI_BUY)
     base_sell = (df["rsi"].shift(1) >= RSI_SELL) & (df["rsi"] < RSI_SELL)
 
-    # Tendencia
-    trend_long = df["ema_fast"] > df["ema_slow"]
+    # Tendencia por EMAs
+    trend_long  = df["ema_fast"] > df["ema_slow"]
     trend_short = df["ema_fast"] < df["ema_slow"]
 
-    # Spread mínimo entre EMAs
-    spread_ok = (
-        (df["ema_fast"] - df["ema_slow"]).abs()
-        / df["ema_slow"].abs()
-        * 100
-        > EMA_SPREAD
-    )
+    # Separación mínima entre EMAs (en %)
+    spread = (df["ema_fast"] - df["ema_slow"]).abs() / df["ema_slow"].abs() * 100.0
+    spread_ok = spread > EMA_SPREAD
 
-    df["buy_sig"] = base_buy & trend_long & spread_ok
+    df["buy_sig"]  = base_buy  & trend_long  & spread_ok
     df["sell_sig"] = base_sell & trend_short & spread_ok
+
     return df
 
 # ================================ Backtest (paper trading) ================================
@@ -182,186 +167,139 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
 def backtest(df: pd.DataFrame) -> pd.DataFrame:
     """
     Devuelve un DataFrame con columnas:
-    ts, symbol, timeframe, side, price, qty, pnl, capital,
-    rsi, ema_fast, ema_slow, atr, reason
+    ts, symbol, timeframe, side, price, qty, pnl, capital, rsi, ema_fast, ema_slow, atr, reason
     """
-    if df.empty or "buy_sig" not in df.columns:
+    if df.empty:
         return pd.DataFrame(
             columns=[
-                "ts",
-                "symbol",
-                "timeframe",
-                "side",
-                "price",
-                "qty",
-                "pnl",
-                "capital",
-                "rsi",
-                "ema_fast",
-                "ema_slow",
-                "atr",
-                "reason",
+                "ts", "symbol", "timeframe", "side", "price", "qty",
+                "pnl", "capital", "rsi", "ema_fast", "ema_slow", "atr", "reason"
             ]
         )
 
     fee = FEE_BPS / 1e4
     capital = INIT_CAP
     pos_qty = 0.0
-    entry = None
-    stop = None
-    take = None
+    entry = stop = take = None
 
     rows = []
 
-    for ts, row in df.iterrows():
-        price = safe_float(row.get("close"))
-        high = safe_float(row.get("high"))
-        low = safe_float(row.get("low"))
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        ts  = df.index[i]
 
-        if np.isnan(price) or np.isnan(high) or np.isnan(low):
-            continue
+        c = float(row["close"])
+        h = float(row["high"])
+        l = float(row["low"])
 
-        rsi_v = safe_float(row.get("rsi"))
-        atr_v = safe_float(row.get("atr"))
-        ef = safe_float(row.get("ema_fast"))
-        es = safe_float(row.get("ema_slow"))
+        rsi_v = float(row["rsi"]) if np.isfinite(row["rsi"]) else np.nan
+        atr_v = float(row["atr"]) if np.isfinite(row["atr"]) else None
+        ef    = float(row["ema_fast"]) if np.isfinite(row["ema_fast"]) else np.nan
+        es    = float(row["ema_slow"]) if np.isfinite(row["ema_slow"]) else np.nan
 
-        buy_flag = to_bool(row.get("buy_sig", False))
-        sell_flag = to_bool(row.get("sell_sig", False))
-
-        # ---- Salidas (TP / SL / señal de venta) ----
+        # --------------------- Salidas (TP / SL / señal de venta) ---------------------
         if pos_qty > 0.0:
-            exit_price = None
+            px = None
             reason = None
 
-            # Take profit
-            if (take is not None) and (high >= take):
-                exit_price = take
-                reason = "TP"
+            if take is not None and h >= take:
+                px, reason = take, "TP"
+            elif stop is not None and l <= stop:
+                px, reason = stop, "SL"
+            elif bool(row["sell_sig"]):
+                px, reason = c, "SELL_SIG"
 
-            # Stop loss
-            elif (stop is not None) and (low <= stop):
-                exit_price = stop
-                reason = "SL"
-
-            # Señal contraria
-            elif sell_flag:
-                exit_price = price
-                reason = "SELL_SIG"
-
-            if exit_price is not None:
-                proceeds = pos_qty * exit_price * (1 - fee)
-                cost_in = pos_qty * entry * (1 + fee)
-                pnl = proceeds - cost_in
+            if px is not None:
+                proceeds = pos_qty * px * (1 - fee)
+                cost_in  = pos_qty * entry * (1 + fee)
+                pnl      = proceeds - cost_in
                 capital += proceeds
 
-                rows.append(
-                    {
-                        "ts": pd.to_datetime(ts).tz_localize(None),
-                        "symbol": SYMBOL,
-                        "timeframe": TIMEFRAME,
-                        "side": "SELL",
-                        "price": round(exit_price, 2),
-                        "qty": round(pos_qty, 8),
-                        "pnl": round(pnl, 2),
-                        "capital": round(capital, 2),
-                        "rsi": round(rsi_v, 2) if not np.isnan(rsi_v) else np.nan,
-                        "ema_fast": round(ef, 2) if not np.isnan(ef) else np.nan,
-                        "ema_slow": round(es, 2) if not np.isnan(es) else np.nan,
-                        "atr": round(atr_v, 2) if not np.isnan(atr_v) else np.nan,
-                        "reason": reason,
-                    }
-                )
+                rows.append({
+                    "ts": pd.to_datetime(ts).tz_localize(None),
+                    "symbol": SYMBOL,
+                    "timeframe": TIMEFRAME,
+                    "side": "SELL",
+                    "price": round(px, 2),
+                    "qty": round(pos_qty, 8),
+                    "pnl": round(pnl, 2),
+                    "capital": round(capital, 2),
+                    "rsi": round(rsi_v, 2),
+                    "ema_fast": round(ef, 2),
+                    "ema_slow": round(es, 2),
+                    "atr": round(atr_v, 2) if atr_v else np.nan,
+                    "reason": reason,
+                })
 
                 pos_qty = 0.0
-                entry = None
-                stop = None
-                take = None
+                entry = stop = take = None
 
-        # ---- Entradas ----
-        if (pos_qty == 0.0) and buy_flag and (atr_v is not None) and (atr_v > 0):
+        # --------------------- Entradas ---------------------
+        if pos_qty == 0.0 and bool(row["buy_sig"]) and atr_v and atr_v > 0:
             risk_cash = capital * RISK_PCT
             stop_dist = ATR_STOP * atr_v
-
             if stop_dist <= 0:
                 continue
 
             qty = risk_cash / stop_dist
+            if qty * c > capital:
+                qty = capital / c
 
-            # No arriesgar más capital del que tenemos
-            if qty * price > capital:
-                qty = capital / price
+            if qty > 0:
+                cost = qty * c * (1 + fee)
+                if cost <= capital:
+                    capital -= cost
+                    pos_qty = qty
+                    entry   = c
+                    stop    = c - stop_dist
+                    take    = c + ATR_TAKE * atr_v
 
-            if qty <= 0:
-                continue
+                    rows.append({
+                        "ts": pd.to_datetime(ts).tz_localize(None),
+                        "symbol": SYMBOL,
+                        "timeframe": TIMEFRAME,
+                        "side": "BUY",
+                        "price": round(entry, 2),
+                        "qty": round(pos_qty, 8),
+                        "pnl": 0.0,
+                        "capital": round(capital, 2),
+                        "rsi": round(rsi_v, 2),
+                        "ema_fast": round(ef, 2),
+                        "ema_slow": round(es, 2),
+                        "atr": round(atr_v, 2) if atr_v else np.nan,
+                        "reason": "ENTRY",
+                    })
 
-            cost = qty * price * (1 + fee)
-            if cost > capital:
-                continue
-
-            capital -= cost
-            pos_qty = qty
-            entry = price
-            stop = price - stop_dist
-            take = price + ATR_TAKE * atr_v
-
-            rows.append(
-                {
-                    "ts": pd.to_datetime(ts).tz_localize(None),
-                    "symbol": SYMBOL,
-                    "timeframe": TIMEFRAME,
-                    "side": "BUY",
-                    "price": round(entry, 2),
-                    "qty": round(pos_qty, 8),
-                    "pnl": 0.0,
-                    "capital": round(capital, 2),
-                    "rsi": round(rsi_v, 2) if not np.isnan(rsi_v) else np.nan,
-                    "ema_fast": round(ef, 2) if not np.isnan(ef) else np.nan,
-                    "ema_slow": round(es, 2) if not np.isnan(es) else np.nan,
-                    "atr": round(atr_v, 2) if not np.isnan(atr_v) else np.nan,
-                    "reason": "ENTRY",
-                }
-            )
-
-    trades = pd.DataFrame(
+    return pd.DataFrame(
         rows,
         columns=[
-            "ts",
-            "symbol",
-            "timeframe",
-            "side",
-            "price",
-            "qty",
-            "pnl",
-            "capital",
-            "rsi",
-            "ema_fast",
-            "ema_slow",
-            "atr",
-            "reason",
+            "ts", "symbol", "timeframe", "side", "price", "qty",
+            "pnl", "capital", "rsi", "ema_fast", "ema_slow", "atr", "reason"
         ],
     )
-    return trades
 
 # ===================================== Logging CSV ======================================
 
 def append_log_csv(trades: pd.DataFrame, path: str):
     """Anexa con cabecera si el archivo no existe o está vacío."""
     if trades is None or trades.empty:
+        print("Sin nuevas operaciones para registrar.")
         return
+
     path = os.path.expanduser(path)
     header_needed = (not os.path.exists(path)) or (os.path.getsize(path) == 0)
+
     trades.to_csv(path, mode="a", header=header_needed, index=False)
+    print(f"Guardadas {len(trades)} filas nuevas en {path}")
 
 # ======================================== Main ==========================================
 
 def main():
-    now = datetime.now(tz.utc).isoformat()
-    print(f"[{now}] Bot {SYMBOL} {TIMEFRAME} iniciado…")
+    print(f"[{datetime.now(tz.utc).isoformat()}] Bot {SYMBOL} {TIMEFRAME} iniciado…")
 
     df = fetch_ohlc()
     if df.empty:
-        print("Sin datos OHLC — fin.")
+        print("Sin datos OHLC — fin de ejecución.")
         return
 
     df = compute_signals(df)
@@ -369,6 +307,12 @@ def main():
     append_log_csv(trades, LOG_PATH)
 
     print(f"Filas nuevas registradas: {len(trades)}  | Log: {LOG_PATH}")
+    if not df.empty:
+        last = df.iloc[-1]
+        print(
+            f"Última vela: close={last['close']:.2f}, RSI={last['rsi']:.2f}, "
+            f"EMA_FAST={last['ema_fast']:.2f}, EMA_SLOW={last['ema_slow']:.2f}"
+        )
 
 if __name__ == "__main__":
     main()
