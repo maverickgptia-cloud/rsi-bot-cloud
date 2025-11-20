@@ -90,6 +90,10 @@ def fetch_ohlc() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
+    # Si yfinance devuelve columnas en MultiIndex (a veces pasa), nos quedamos con el nivel del campo
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(-1)
+
     df = df.rename(
         columns={
             "Open": "open",
@@ -100,14 +104,21 @@ def fetch_ohlc() -> pd.DataFrame:
             "Volume": "volume",
         }
     )
-    df.index.name = "ts"
-    df = df.dropna().tail(LOOKBACK)
-    # Aseguramos float
-    for col in ["open", "high", "low", "close", "volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Nos quedamos sólo con las columnas que usamos
+    cols = ["open", "high", "low", "close", "volume"]
+    df = df[cols]
+
+    # Quitamos filas con huecos y recortamos al LOOKBACK
     df = df.dropna()
+    df = df.tail(LOOKBACK)
+
+    # Forzamos a float todo el bloque OHLC
+    df = df.astype(float)
+
+    df.index.name = "ts"
     return df
+
 
 def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
     c = df["close"]
