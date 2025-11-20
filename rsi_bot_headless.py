@@ -86,38 +86,65 @@ def to_bool(val) -> bool:
 # ================================== Datos e indicadores ==================================
 
 def fetch_ohlc() -> pd.DataFrame:
-    df = yf.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False)
-    if df.empty:
-        return pd.DataFrame()
-
-    # Si yfinance devuelve columnas en MultiIndex (a veces pasa), nos quedamos con el nivel del campo
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
-
-    df = df.rename(
-        columns={
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-            "Adj Close": "close",
-            "Volume": "volume",
-        }
+    """
+    Descarga OHLC con yfinance y devuelve un DataFrame con columnas:
+    ['open', 'high', 'low', 'close', 'volume'] y el índice como fecha.
+    Soporta tanto columnas normales como MultiIndex (ticker, campo).
+    """
+    raw = yf.download(
+        SYMBOL,
+        period=PERIOD,
+        interval=INTERVAL,
+        progress=False,
+        auto_adjust=False,   # que no ajuste dividendos/ splits
+        group_by="ticker"    # a veces devuelve MultiIndex con el ticker
     )
 
-    # Nos quedamos sólo con las columnas que usamos
-    cols = ["open", "high", "low", "close", "volume"]
-    df = df[cols]
+    if raw.empty:
+        return pd.DataFrame()
 
-    # Quitamos filas con huecos y recortamos al LOOKBACK
-    df = df.dropna()
-    df = df.tail(LOOKBACK)
+    # Si viene con MultiIndex tipo (ticker, 'Open'), (ticker, 'High'), etc.
+    if isinstance(raw.columns, pd.MultiIndex):
+        # Si el primer nivel contiene el símbolo, nos quedamos solo con él
+        if SYMBOL in raw.columns.get_level_values(0):
+            df = raw.xs(SYMBOL, axis=1, level=0)
+        else:
+            # Por si acaso, aplanamos tomando el último nivel
+            df = raw.copy()
+            df.columns = [c[-1] for c in df.columns]
+    else:
+        df = raw.copy()
 
-    # Forzamos a float todo el bloque OHLC
-    df = df.astype(float)
+    # Normalizamos nombres a minúsculas
+    df = df.rename(columns={
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Adj Close": "close",
+        "Volume": "volume",
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "volume": "volume",
+    })
+
+    # Nos quedamos solo con las columnas necesarias si existen
+    needed = ["open", "high", "low", "close", "volume"]
+    cols_presentes = [c for c in needed if c in df.columns]
+
+    if len(cols_presentes) < 4:  # demasiado raro / incompleto
+        return pd.DataFrame()
+
+    df = df[cols_presentes]
 
     df.index.name = "ts"
+    # Últimas LOOKBACK velas, todo como float
+    df = df.dropna().tail(LOOKBACK).astype(float)
+
     return df
+
 
 
 def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
